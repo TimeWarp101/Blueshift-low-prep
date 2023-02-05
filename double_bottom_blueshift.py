@@ -16,7 +16,7 @@ def initialize(context):
         A function to define things to do at the start of the strategy
     """
     # universe selection
-    context.securities = [symbol('INFY'), ]
+    context.securities = [symbol('TCS')]
     # define strategy parameters
     context.params = {'indicator_lookback':1100,
                       'indicator_freq':'1m',
@@ -24,22 +24,24 @@ def initialize(context):
                       'ROC_period_short':30,
                       'ROC_period_long':120,
                       'BBands_period':300,
-                      'trade_freq':5,
+                      'trade_freq':15,
                       'leverage':1,
-                      'double_bottom_min_spread':15,
-                      'double_bottom_max_spread':500,
-                      'double_bottom_valley_tolerance':0.01
+                      'double_bottom_min_spread':3,
+                      'double_bottom_max_spread':50,
+                      'double_bottom_valley_tolerance':0.008,
+                      'double_bottom_slope_tolerance':0.4
                       }
 
     # variable to control trading frequency
     context.bar_count = 0
-
+    context.valley_reject = 0
+    context.slope_reject = 0
     # Constants
     context.UP = 1
     context.DOWN = -1
     context.NO_DIR = 0
-    context.up_thresh = 0.01
-    context.down_thresh = -0.01
+    context.up_thresh = 0.008
+    context.down_thresh = -0.008
 
     # variables to track signals and target portfolio
     context.signals = dict((security,0) for security in context.securities)
@@ -107,7 +109,6 @@ def generate_target_position(context, data):
     '''
         A function to define target portfolio
     '''
-    
     num_secs = len(context.securities)
     weight = round(1.0/num_secs,2)*context.params['leverage']
 
@@ -131,7 +132,9 @@ def generate_signals(context, data):
 
     for security in context.securities:
         px = price_data.xs(security)
-        candle = convert_into_5min(px)
+        if len(px) < context.params['trade_freq']:
+            continue
+        candle = get_candle(px, context.params['trade_freq'])
         context.candles_5min[security].append(candle)
         if len(context.candles_5min[security]) > context.params['indicator_lookback']:
             context.candles_5min[security] = context.candles_5min[security][-context.params['indicator_lookback'] : ]
@@ -139,12 +142,11 @@ def generate_signals(context, data):
             context.signals[security])
 
 
-
 def signal_function(context, security, candles, params, last_signal):
     """
         The main trading logic goes here, called by generate_signals above
     """
-    res_signal = last_signal
+    res_signal = 0
     if len(candles) == 0:
         return 0
     double_btm_found = False
@@ -193,7 +195,10 @@ def signal_function(context, security, candles, params, last_signal):
         if double_btm_found and last_signal == 0:
             context.stop_loss[security] = 0.998 * pivot_values[-2]
             context.take_profit[security] = 2 * pivot_values[-1] - pivot_values[-2]
-            
+            print_str = ""
+            for i in range(-5,0):
+                print_str = print_str + f" ({pivot_points[i]}, {pivot_values[i]})"
+            print(print_str)
 
         if len(pivot_values) > 10:
             pivot_values = pivot_values[-10:]
@@ -202,12 +207,12 @@ def signal_function(context, security, candles, params, last_signal):
         print(e)
         return 0
     
-    if last_signal == 0 and res_signal == 1 and double_btm_found:
-        start_index = max(-1000, pivot_points[-5] - curr_bar - 1)
-        print_str = ""
-        for i in range(start_index, 0):
-            print_str = print_str + " " + str(prices[i])
-        print(print_str)
+    # if last_signal == 0 and res_signal == 1 and double_btm_found:
+    #     start_index = max(-1000, pivot_points[-5] - curr_bar - 1)
+    #     print_str = ""
+    #     for i in range(start_index, 0):
+    #         print_str = print_str + " " + str(prices[i])
+    #     print(print_str)
         
     return res_signal
 
@@ -215,34 +220,50 @@ def signal_function(context, security, candles, params, last_signal):
 def is_double_bottom(context, pivot_points, pivot_values):
     min_spread = context.params['double_bottom_min_spread']
     max_spread = context.params['double_bottom_max_spread']
+    slope_tolerance = context.params['double_bottom_slope_tolerance']
     valley_tolerance = context.params['double_bottom_valley_tolerance']
     if len(pivot_values) < 5:
         return False
     if pivot_values[-5] <= pivot_values[-3]:
         return False
-    if pivot_points[-1] - pivot_points[-3] > max_spread or pivot_points[-1] - pivot_points[-3] < min_spread or pivot_points[-2] - pivot_points[-4] > max_spread or pivot_points[-2] - pivot_points[-4] < min_spread:
+    # for i in range(-4, -1):
+    #     if pivot_points[i+1] - pivot_points[i] > max_spread or pivot_points[i+1] - pivot_points[i] < min_spread:
+    #         return False
+    slope1 = (pivot_values[-1]-pivot_values[-2])/(pivot_points[-1]-pivot_points[-2])
+    slope2 = (pivot_values[-2]-pivot_values[-3])/(pivot_points[-2]-pivot_points[-3])
+    slope3 = (pivot_values[-3]-pivot_values[-4])/(pivot_points[-3]-pivot_points[-4])
+    slope4 = (pivot_values[-4]-pivot_values[-5])/(pivot_points[-4]-pivot_points[-5])
+
+    if abs((slope1/(-slope2))-1) > slope_tolerance or abs((slope2/(-slope3))-1) > slope_tolerance:
+        context.slope_reject = context.slope_reject + 1
+        if context.slope_reject % 10 == 0:
+            print(f"Slope reject count : {context.slope_reject}")
         return False
-    if abs(1 - pivot_values[-1]/pivot_values[-3]) <= valley_tolerance and abs(1 - pivot_values[-2]/pivot_values[-4]) <= valley_tolerance:
-        return True
+
+    if abs(1 - pivot_values[-1]/pivot_values[-3]) > valley_tolerance or abs(1 - pivot_values[-2]/pivot_values[-4]) > valley_tolerance:
+        context.valley_reject = context.valley_reject + 1
+        if context.valley_reject % 10 == 0:
+            print(f"Valley reject count : {context.valley_reject}")
+        return False
     
-    return False
+
+    return True
                     
-def convert_into_5min(px):
+def get_candle(px, n):
 	
-    print(px)
     candle = {
 		"open":0,
 		"high":-1e9,
 		"close":0,
 		"low":1e9
 	    }
-    Open = px.open.values[-5:]
-    High = px.high.values[-5:]
-    Close = px.close.values[-5:]
-    Low = px.low.values[-5:]
+    Open = px.open.values[-n:]
+    High = px.high.values[-n:]
+    Close = px.close.values[-n:]
+    Low = px.low.values[-n:]
 
     candle["open"]=Open[0]
-    candle["close"]=Close[4]
+    candle["close"]=Close[n-1]
     for x in High:
         candle["high"]=max(candle["high"],x)
 
